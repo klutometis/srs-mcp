@@ -50,7 +50,10 @@ def reseed() -> int:
 
 def main() -> None:
     n = reseed()
-    print(f"reseeded {n} cards (Western Canon)")
+    print(f"reseeded {n} cards (Western Canon):")
+    for i, (front, back) in enumerate(WESTERN_CANON, 1):
+        print(f"  {i:2}. Q: {front}")
+        print(f"      A: {back}")
 
 
 if __name__ == "__main__":
