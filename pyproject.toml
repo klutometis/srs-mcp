@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "srs-mcp"
+version = "0.1.0"
+description = "Agent-agnostic MCP server for spaced-repetition learning (FSRS). Add cards, review what's due, grade recall — no Anki GUI required."
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=3.0.2",
+    "fsrs>=4.0.0",
+]
+
+[project.scripts]
+srs-mcp = "srs_mcp:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["srs_mcp"]
