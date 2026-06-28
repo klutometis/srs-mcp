@@ -42,6 +42,17 @@ MCP_TRANSPORT=stdio uv run srs-mcp
 
 ## Storage
 
-Cards live in a SQLite file at `SRS_DB` (default `./srs.db`). In prod,
-mount a Railway volume at `/data` and keep `SRS_DB=/data/srs.db` so the
-box survives redeploys.
+Two backends, chosen at startup:
+
+- **Postgres (shared deck)** — set `SRS_DATABASE_URL` (or `DATABASE_URL`)
+  to a Postgres connection string (e.g. a Neon DB). Every deployment that
+  points at the same URL reads/writes **one shared deck**, so you can add
+  and review cards from anywhere (local, Railway, etc.). FSRS card ids are
+  large, so the `cards.card_id` column is `BIGINT` on Postgres. Requires
+  the `psycopg` dependency (already declared).
+- **SQLite (fallback)** — when no `*DATABASE_URL` is set, cards live in a
+  SQLite file at `SRS_DB` (default `./srs.db`). Single-host / offline. In
+  a SQLite-on-Railway setup, mount a volume at `/data` and keep
+  `SRS_DB=/data/srs.db` so the box survives redeploys.
+
+The schema is identical (table `cards`) and auto-created on first use.

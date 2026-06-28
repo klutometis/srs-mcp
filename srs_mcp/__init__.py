@@ -17,19 +17,31 @@ No GUI, no Xvfb, no AnkiConnect — just the FSRS scheduler + a tiny store.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
-import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
 from fastmcp import FastMCP
 from fsrs import Card, Rating, Scheduler
 
-SRS_DB = Path(
-    os.environ.get("SRS_DB") or (Path(__file__).resolve().parent.parent / "srs.db")
-).resolve()
-SRS_DB.parent.mkdir(parents=True, exist_ok=True)
+# Storage backend: a shared Postgres deck (e.g. Neon) when SRS_DATABASE_URL /
+# DATABASE_URL is set, so every deployment reads/writes the same cards;
+# otherwise a local SQLite file (offline / single-host fallback).
+_DB_URL = os.environ.get("SRS_DATABASE_URL") or os.environ.get("DATABASE_URL")
+_PG = bool(_DB_URL)
+
+if _PG:
+    import psycopg
+    from psycopg.rows import dict_row
+else:
+    import sqlite3
+
+    SRS_DB = Path(
+        os.environ.get("SRS_DB") or (Path(__file__).resolve().parent.parent / "srs.db")
+    ).resolve()
+    SRS_DB.parent.mkdir(parents=True, exist_ok=True)
 
 mcp = FastMCP("srs-mcp")
 _scheduler = Scheduler()
@@ -50,22 +62,46 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _db() -> sqlite3.Connection:
-    conn = sqlite3.connect(SRS_DB)
-    conn.row_factory = sqlite3.Row
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS cards (
-            card_id INTEGER PRIMARY KEY,
-            front   TEXT NOT NULL,
-            back    TEXT NOT NULL,
-            deck    TEXT NOT NULL DEFAULT 'default',
-            fsrs    TEXT NOT NULL,
-            due     TEXT NOT NULL,
-            reps    INTEGER NOT NULL DEFAULT 0,
-            created TEXT NOT NULL
-        )"""
-    )
-    return conn
+def _q(sql: str) -> str:
+    """Translate the SQLite '?' placeholder to Postgres '%s' when on PG."""
+    return sql.replace("?", "%s") if _PG else sql
+
+
+_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS cards ("
+    "  card_id {idtype} PRIMARY KEY,"
+    "  front   TEXT NOT NULL,"
+    "  back    TEXT NOT NULL,"
+    "  deck    TEXT NOT NULL DEFAULT 'default',"
+    "  fsrs    TEXT NOT NULL,"
+    "  due     TEXT NOT NULL,"
+    "  reps    INTEGER NOT NULL DEFAULT 0,"
+    "  created TEXT NOT NULL"
+    ")"
+)
+
+
+@contextlib.contextmanager
+def _db():
+    """Yield a connection (Postgres or SQLite), commit on success, always close.
+
+    Rows are dict-like in both backends, so callers use row["col"] and
+    dict(row) uniformly. FSRS card ids are large, so Postgres uses BIGINT.
+    """
+    if _PG:
+        conn = psycopg.connect(_DB_URL, row_factory=dict_row)
+    else:
+        conn = sqlite3.connect(SRS_DB)
+        conn.row_factory = sqlite3.Row
+    try:
+        conn.execute(_SCHEMA.format(idtype="BIGINT" if _PG else "INTEGER"))
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _due_iso(card: Card) -> str:
@@ -84,8 +120,8 @@ def add_card(front: str, back: str, deck: str = "default") -> str:
     card = Card()
     with _db() as conn:
         conn.execute(
-            "INSERT INTO cards (card_id, front, back, deck, fsrs, due, reps, created) "
-            "VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+            _q("INSERT INTO cards (card_id, front, back, deck, fsrs, due, reps, created) "
+               "VALUES (?, ?, ?, ?, ?, ?, 0, ?)"),
             (card.card_id, front, back, deck.strip() or "default",
              card.to_json(), _due_iso(card), _now()),
         )
@@ -107,7 +143,7 @@ def due_cards(deck: str | None = None, limit: int = 20) -> str:
     q += " ORDER BY due ASC LIMIT ?"
     args.append(max(1, int(limit)))
     with _db() as conn:
-        rows = conn.execute(q, args).fetchall()
+        rows = conn.execute(_q(q), args).fetchall()
     return json.dumps([dict(r) for r in rows])
 
 
@@ -121,7 +157,7 @@ def grade_card(card_id: int, rating: str) -> str:
         raise ValueError("rating must be one of: again, hard, good, easy")
     with _db() as conn:
         row = conn.execute(
-            "SELECT fsrs, reps FROM cards WHERE card_id = ?", (card_id,)
+            _q("SELECT fsrs, reps FROM cards WHERE card_id = ?"), (card_id,)
         ).fetchone()
         if row is None:
             raise FileNotFoundError(f"no card with id {card_id}")
@@ -129,7 +165,7 @@ def grade_card(card_id: int, rating: str) -> str:
         card, _log = _scheduler.review_card(card, _RATINGS[key])
         reps = int(row["reps"]) + 1
         conn.execute(
-            "UPDATE cards SET fsrs = ?, due = ?, reps = ? WHERE card_id = ?",
+            _q("UPDATE cards SET fsrs = ?, due = ?, reps = ? WHERE card_id = ?"),
             (card.to_json(), _due_iso(card), reps, card_id),
         )
     return json.dumps(
@@ -150,7 +186,7 @@ def list_cards(deck: str | None = None, limit: int = 50) -> str:
     q += " ORDER BY created DESC LIMIT ?"
     args.append(max(1, int(limit)))
     with _db() as conn:
-        rows = conn.execute(q, args).fetchall()
+        rows = conn.execute(_q(q), args).fetchall()
     return json.dumps([dict(r) for r in rows])
 
 
@@ -158,7 +194,7 @@ def list_cards(deck: str | None = None, limit: int = 50) -> str:
 def delete_card(card_id: int) -> str:
     """Delete a card by id (reset / cleanup)."""
     with _db() as conn:
-        cur = conn.execute("DELETE FROM cards WHERE card_id = ?", (card_id,))
+        cur = conn.execute(_q("DELETE FROM cards WHERE card_id = ?"), (card_id,))
     if cur.rowcount == 0:
         raise FileNotFoundError(f"no card with id {card_id}")
     return f"deleted {card_id}"
@@ -172,13 +208,13 @@ def stats(deck: str | None = None) -> str:
     where = " WHERE deck = ?" if deck else ""
     args = [deck] if deck else []
     with _db() as conn:
-        total = conn.execute(f"SELECT COUNT(*) c FROM cards{where}", args).fetchone()["c"]
+        total = conn.execute(_q(f"SELECT COUNT(*) c FROM cards{where}"), args).fetchone()["c"]
         due = conn.execute(
-            f"SELECT COUNT(*) c FROM cards WHERE due <= ?" + (" AND deck = ?" if deck else ""),
+            _q("SELECT COUNT(*) c FROM cards WHERE due <= ?" + (" AND deck = ?" if deck else "")),
             [now] + args,
         ).fetchone()["c"]
         reps = conn.execute(
-            f"SELECT COALESCE(SUM(reps),0) s FROM cards{where}", args
+            _q(f"SELECT COALESCE(SUM(reps),0) s FROM cards{where}"), args
         ).fetchone()["s"]
         decks = [r["deck"] for r in conn.execute(
             "SELECT DISTINCT deck FROM cards ORDER BY deck"
