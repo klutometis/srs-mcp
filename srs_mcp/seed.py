@@ -7,7 +7,10 @@ clean, known set). Run on the box:  python -m srs_mcp.seed
 
 from __future__ import annotations
 
-from srs_mcp import _db, add_card
+import argparse
+import sys
+
+from srs_mcp import _PG, _db, add_card
 
 # (front, back) — plain text (no markdown) so the TTS reads them cleanly.
 WESTERN_CANON: list[tuple[str, str]] = [
@@ -49,6 +52,24 @@ def reseed() -> int:
 
 
 def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="Reseed the SRS deck with the Western Canon set. "
+        "DESTRUCTIVE: deletes ALL existing cards first."
+    )
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="Required when pointed at a shared Postgres deck "
+        "(SRS_DATABASE_URL/DATABASE_URL set), since it wipes everyone's cards.",
+    )
+    args = ap.parse_args()
+    if _PG and not args.force:
+        sys.stderr.write(
+            "REFUSING: srs-seed deletes ALL cards, and this points at a SHARED Postgres "
+            "deck (SRS_DATABASE_URL/DATABASE_URL is set). Re-run with --force if you truly "
+            "mean to wipe the shared deck, or unset the DB URL to seed a local SQLite file.\n"
+        )
+        raise SystemExit(2)
     n = reseed()
     print(f"reseeded {n} cards (Western Canon):")
     for i, (front, back) in enumerate(WESTERN_CANON, 1):
