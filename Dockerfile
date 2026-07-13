@@ -7,7 +7,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 WORKDIR /app
-COPY pyproject.toml ./
+# README.md is required by pyproject's `readme = "README.md"` at build time.
+COPY pyproject.toml README.md ./
 COPY srs_mcp ./srs_mcp
 RUN uv sync
 
