@@ -7,6 +7,8 @@ A small, agent-agnostic FSRS card box. Same algorithm modern Anki uses
 - due_cards(deck, limit)       : what's due for review right now.
 - grade_card(card_id, rating)  : record recall (again/hard/good/easy);
                                  FSRS computes the next due date.
+- edit_card(card_id, ...)      : fix content without touching the schedule.
+- suspend_card / unsuspend_card: shelve a card (out of the queue) / restore.
 - list_cards / stats           : inspect the box.
 - delete_card                  : remove one (reset / cleanup).
 
@@ -76,9 +78,28 @@ _SCHEMA = (
     "  fsrs    TEXT NOT NULL,"
     "  due     TEXT NOT NULL,"
     "  reps    INTEGER NOT NULL DEFAULT 0,"
-    "  created TEXT NOT NULL"
+    "  created TEXT NOT NULL,"
+    "  suspended INTEGER NOT NULL DEFAULT 0"
     ")"
 )
+
+
+def _migrate(conn) -> None:
+    """Add columns introduced after the original schema, idempotently, so
+    decks created by earlier versions keep working. `suspended` (0/1) lets a
+    card be shelved: kept with its history/schedule but out of the due queue.
+    """
+    if _PG:
+        conn.execute(
+            "ALTER TABLE cards ADD COLUMN IF NOT EXISTS "
+            "suspended INTEGER NOT NULL DEFAULT 0"
+        )
+    else:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(cards)").fetchall()}
+        if "suspended" not in cols:
+            conn.execute(
+                "ALTER TABLE cards ADD COLUMN suspended INTEGER NOT NULL DEFAULT 0"
+            )
 
 
 @contextlib.contextmanager
@@ -95,6 +116,7 @@ def _db():
         conn.row_factory = sqlite3.Row
     try:
         conn.execute(_SCHEMA.format(idtype="BIGINT" if _PG else "INTEGER"))
+        _migrate(conn)
         yield conn
         conn.commit()
     except Exception:
@@ -135,7 +157,7 @@ def due_cards(deck: str | None = None, limit: int = 20) -> str:
     Quiz the user with `front`, check against `back`, then call grade_card.
     Returns '[]' when nothing is due."""
     now = _now()
-    q = "SELECT card_id, front, back, deck, due FROM cards WHERE due <= ?"
+    q = "SELECT card_id, front, back, deck, due FROM cards WHERE suspended = 0 AND due <= ?"
     args: list = [now]
     if deck:
         q += " AND deck = ?"
@@ -177,8 +199,8 @@ def grade_card(card_id: int, rating: str) -> str:
 def list_cards(deck: str | None = None, limit: int = 50) -> str:
     """List cards (newest first) regardless of due date, for an overview.
     Optionally filter by `deck`. Returns JSON array of
-    {card_id, front, back, deck, due, reps}."""
-    q = "SELECT card_id, front, back, deck, due, reps FROM cards"
+    {card_id, front, back, deck, due, reps, suspended}."""
+    q = "SELECT card_id, front, back, deck, due, reps, suspended FROM cards"
     args: list = []
     if deck:
         q += " WHERE deck = ?"
@@ -188,6 +210,78 @@ def list_cards(deck: str | None = None, limit: int = 50) -> str:
     with _db() as conn:
         rows = conn.execute(_q(q), args).fetchall()
     return json.dumps([dict(r) for r in rows])
+
+
+@mcp.tool
+def edit_card(
+    card_id: int,
+    front: str | None = None,
+    back: str | None = None,
+    deck: str | None = None,
+) -> str:
+    """Edit a card's content without disturbing its schedule. Update any of
+    `front`, `back`, `deck` (omit or pass null to leave unchanged); the FSRS
+    review state (difficulty, stability, due date, reps) is preserved. Use
+    this to fix typos or add context instead of creating a duplicate card.
+    Returns JSON {card_id, front, back, deck}."""
+    sets: list[str] = []
+    args: list = []
+    if front is not None:
+        f = front.strip()
+        if not f:
+            raise ValueError("front cannot be blank")
+        sets.append("front = ?")
+        args.append(f)
+    if back is not None:
+        b = back.strip()
+        if not b:
+            raise ValueError("back cannot be blank")
+        sets.append("back = ?")
+        args.append(b)
+    if deck is not None:
+        sets.append("deck = ?")
+        args.append(deck.strip() or "default")
+    if not sets:
+        raise ValueError("nothing to update: pass at least one of front, back, deck")
+    args.append(card_id)
+    with _db() as conn:
+        cur = conn.execute(
+            _q(f"UPDATE cards SET {', '.join(sets)} WHERE card_id = ?"), args
+        )
+        if cur.rowcount == 0:
+            raise FileNotFoundError(f"no card with id {card_id}")
+        row = conn.execute(
+            _q("SELECT card_id, front, back, deck FROM cards WHERE card_id = ?"),
+            (card_id,),
+        ).fetchone()
+    return json.dumps(dict(row))
+
+
+def _set_suspended(card_id: int, value: int) -> str:
+    with _db() as conn:
+        cur = conn.execute(
+            _q("UPDATE cards SET suspended = ? WHERE card_id = ?"), (value, card_id)
+        )
+    if cur.rowcount == 0:
+        raise FileNotFoundError(f"no card with id {card_id}")
+    return json.dumps({"card_id": card_id, "suspended": bool(value)})
+
+
+@mcp.tool
+def suspend_card(card_id: int) -> str:
+    """Shelve a card: keep it (with its full history and schedule) but remove
+    it from the due queue, so it won't surface in due_cards until unsuspended.
+    Reversible, non-destructive alternative to delete_card for cards you're
+    unsure about. Returns JSON {card_id, suspended}."""
+    return _set_suspended(card_id, 1)
+
+
+@mcp.tool
+def unsuspend_card(card_id: int) -> str:
+    """Un-shelve a previously suspended card, returning it to the review queue
+    (it becomes due again per its existing schedule). Returns JSON
+    {card_id, suspended}."""
+    return _set_suspended(card_id, 0)
 
 
 @mcp.tool
@@ -210,8 +304,14 @@ def stats(deck: str | None = None) -> str:
     with _db() as conn:
         total = conn.execute(_q(f"SELECT COUNT(*) c FROM cards{where}"), args).fetchone()["c"]
         due = conn.execute(
-            _q("SELECT COUNT(*) c FROM cards WHERE due <= ?" + (" AND deck = ?" if deck else "")),
+            _q("SELECT COUNT(*) c FROM cards WHERE suspended = 0 AND due <= ?"
+               + (" AND deck = ?" if deck else "")),
             [now] + args,
+        ).fetchone()["c"]
+        suspended = conn.execute(
+            _q(f"SELECT COUNT(*) c FROM cards WHERE suspended = 1"
+               + (" AND deck = ?" if deck else "")),
+            args,
         ).fetchone()["c"]
         reps = conn.execute(
             _q(f"SELECT COALESCE(SUM(reps),0) s FROM cards{where}"), args
@@ -219,7 +319,8 @@ def stats(deck: str | None = None) -> str:
         decks = [r["deck"] for r in conn.execute(
             "SELECT DISTINCT deck FROM cards ORDER BY deck"
         ).fetchall()]
-    return json.dumps({"total": total, "due_now": due, "reviews": reps, "decks": decks})
+    return json.dumps({"total": total, "due_now": due, "suspended": suspended,
+                       "reviews": reps, "decks": decks})
 
 
 def main() -> None:

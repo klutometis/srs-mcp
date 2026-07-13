@@ -23,9 +23,11 @@ and this server is ~200 lines around it.
 - `add_card(front, back, deck="default") -> {card_id, due}` — author + schedule a card
 - `due_cards(deck=None, limit=20) -> [{card_id, front, back, deck, due}]` — what's due now
 - `grade_card(card_id, rating) -> {card_id, rating, next_due, reps}` — record recall (`again`/`hard`/`good`/`easy`, or 1-4)
+- `edit_card(card_id, front=None, back=None, deck=None)` — edit content in place; schedule is preserved (fix typos / add context instead of duplicating)
+- `suspend_card(card_id)` / `unsuspend_card(card_id)` — shelve a card (kept with its history, removed from the due queue) / restore it
 - `list_cards(deck=None, limit=50)` — overview regardless of due date
 - `delete_card(card_id)` — remove one (reset / cleanup)
-- `stats(deck=None) -> {total, due_now, reviews, decks}`
+- `stats(deck=None) -> {total, due_now, suspended, reviews, decks}`
 
 The review loop: `due_cards` → quiz the user with `front` → check against
 `back` → `grade_card`. FSRS computes the next due date from the rating.
