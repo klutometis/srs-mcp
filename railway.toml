@@ -4,6 +4,10 @@ builder = "dockerfile"
 [deploy]
 startCommand = "uv run srs-mcp"
 restartPolicyType = "always"
+# srs-mcp serves the MCP protocol at /mcp and a plain 200 at / (see _health).
+# Point Railway's probe at / so deploys don't fail a 404 healthcheck.
+healthcheckPath = "/"
+healthcheckTimeout = 60
 
 # Set in the Railway service:
 #   SRS_DB=/data/srs.db   (mount a volume at /data so cards persist)

@@ -48,6 +48,15 @@ else:
 mcp = FastMCP("srs-mcp")
 _scheduler = Scheduler()
 
+
+@mcp.custom_route("/", methods=["GET"])
+async def _health(_request):
+    """Liveness probe. FastMCP serves the protocol at /mcp; platforms like
+    Railway health-check '/', which would otherwise 404 and fail the deploy."""
+    from starlette.responses import PlainTextResponse
+
+    return PlainTextResponse("ok")
+
 _RATINGS = {
     "again": Rating.Again,
     "hard": Rating.Hard,
