@@ -35,3 +35,8 @@ srs-seed = "srs_mcp.seed:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["srs_mcp"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

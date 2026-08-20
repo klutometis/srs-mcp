@@ -3,8 +3,9 @@
 A small, agent-agnostic FSRS card box. Same algorithm modern Anki uses
 (Free Spaced Repetition Scheduler), wrapped in five tools:
 
-- add_card(front, back, deck)  : author a card; scheduled immediately.
-- due_cards(deck, limit)       : what's due for review right now.
+- add_card(front, back)        : author a card; scheduled immediately.
+- due_cards(q, limit)          : what's due for review right now, optionally
+                                 narrowed to a topic by text search.
 - grade_card(card_id, rating)  : record recall (again/hard/good/easy);
                                  FSRS computes the next due date.
 - edit_card(card_id, ...)      : fix content without touching the schedule.
@@ -78,6 +79,23 @@ def _q(sql: str) -> str:
     return sql.replace("?", "%s") if _PG else sql
 
 
+# Topic search: case-insensitive substring over the card's text. Cheap, and it
+# beats the old exact-match `deck` filter badly on the real deck -- q='horac'
+# finds 89 of the 97 Horace cards where the best deck= value found 20 --
+# because it reads what the card *says* rather than a free-text label an agent
+# picked at random. See plans/002-decks.md.
+_SEARCH_SQL = "LOWER(front || ' ' || back) LIKE ? ESCAPE '\\'"
+
+
+def _like(term: str) -> str:
+    """Wrap a search term for LIKE, escaping wildcards so a query for '100%'
+    or 'snake_case' matches literally instead of everything."""
+    t = term.strip().lower()
+    for ch in ("\\", "%", "_"):
+        t = t.replace(ch, "\\" + ch)
+    return f"%{t}%"
+
+
 _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS cards ("
     "  card_id {idtype} PRIMARY KEY,"
@@ -140,10 +158,16 @@ def _due_iso(card: Card) -> str:
 
 
 @mcp.tool
-def add_card(front: str, back: str, deck: str = "default") -> str:
+def add_card(front: str, back: str) -> str:
     """Author a new flashcard and schedule it. `front` is the prompt/question,
-    `back` is the answer. Optional `deck` groups cards (default 'default').
-    Returns JSON {card_id, due}. The card is due immediately (first review)."""
+    `back` is the answer. Returns JSON {card_id, due}. The card is due
+    immediately (first review).
+
+    Keep `back` SHORT — ideally a word or a phrase, and rarely more than one
+    sentence. A card you cannot grade in a couple of seconds is a note, not a
+    flashcard, and it will silently stop getting reviewed. Split anything
+    longer into several cards. Put the topic in the card's own text ("Horace,
+    Odes 1.11: ...") so it can be found by searching for it later."""
     front = (front or "").strip()
     back = (back or "").strip()
     if not front or not back:
@@ -151,30 +175,36 @@ def add_card(front: str, back: str, deck: str = "default") -> str:
     card = Card()
     with _db() as conn:
         conn.execute(
-            _q("INSERT INTO cards (card_id, front, back, deck, fsrs, due, reps, created) "
-               "VALUES (?, ?, ?, ?, ?, ?, 0, ?)"),
-            (card.card_id, front, back, deck.strip() or "default",
-             card.to_json(), _due_iso(card), _now()),
+            _q("INSERT INTO cards (card_id, front, back, fsrs, due, reps, created) "
+               "VALUES (?, ?, ?, ?, ?, 0, ?)"),
+            (card.card_id, front, back, card.to_json(), _due_iso(card), _now()),
         )
     return json.dumps({"card_id": card.card_id, "due": _due_iso(card)})
 
 
 @mcp.tool
-def due_cards(deck: str | None = None, limit: int = 20) -> str:
-    """List cards due for review now (due <= now), soonest first. Optionally
-    filter by `deck`. Returns a JSON array of {card_id, front, back, deck, due}.
-    Quiz the user with `front`, check against `back`, then call grade_card.
-    Returns '[]' when nothing is due."""
+def due_cards(q: str | None = None, limit: int = 20, deck: str | None = None) -> str:
+    """List cards due for review now (due <= now), soonest first. Returns a
+    JSON array of {card_id, front, back, deck, due}. Quiz the user with
+    `front`, check against `back`, then call grade_card. Returns '[]' when
+    nothing is due.
+
+    `q` narrows to a topic by case-insensitive substring over the card text --
+    q='horace' for "quiz me on Horace". `deck` is a legacy exact-match filter
+    kept for old cards; prefer `q`."""
     now = _now()
-    q = "SELECT card_id, front, back, deck, due FROM cards WHERE suspended = 0 AND due <= ?"
+    sql = "SELECT card_id, front, back, deck, due FROM cards WHERE suspended = 0 AND due <= ?"
     args: list = [now]
+    if q and q.strip():
+        sql += f" AND {_SEARCH_SQL}"
+        args.append(_like(q))
     if deck:
-        q += " AND deck = ?"
+        sql += " AND deck = ?"
         args.append(deck)
-    q += " ORDER BY due ASC LIMIT ?"
+    sql += " ORDER BY due ASC LIMIT ?"
     args.append(max(1, int(limit)))
     with _db() as conn:
-        rows = conn.execute(_q(q), args).fetchall()
+        rows = conn.execute(_q(sql), args).fetchall()
     return json.dumps([dict(r) for r in rows])
 
 
@@ -205,19 +235,27 @@ def grade_card(card_id: int, rating: str) -> str:
 
 
 @mcp.tool
-def list_cards(deck: str | None = None, limit: int = 50) -> str:
+def list_cards(q: str | None = None, limit: int = 50, deck: str | None = None) -> str:
     """List cards (newest first) regardless of due date, for an overview.
-    Optionally filter by `deck`. Returns JSON array of
-    {card_id, front, back, deck, due, reps, suspended}."""
-    q = "SELECT card_id, front, back, deck, due, reps, suspended FROM cards"
+    Returns JSON array of {card_id, front, back, deck, due, reps, suspended}.
+
+    `q` narrows to a topic by case-insensitive substring over the card text.
+    `deck` is a legacy exact-match filter kept for old cards; prefer `q`."""
+    sql = "SELECT card_id, front, back, deck, due, reps, suspended FROM cards"
+    where: list[str] = []
     args: list = []
+    if q and q.strip():
+        where.append(_SEARCH_SQL)
+        args.append(_like(q))
     if deck:
-        q += " WHERE deck = ?"
+        where.append("deck = ?")
         args.append(deck)
-    q += " ORDER BY created DESC LIMIT ?"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY created DESC LIMIT ?"
     args.append(max(1, int(limit)))
     with _db() as conn:
-        rows = conn.execute(_q(q), args).fetchall()
+        rows = conn.execute(_q(sql), args).fetchall()
     return json.dumps([dict(r) for r in rows])
 
 
@@ -226,13 +264,12 @@ def edit_card(
     card_id: int,
     front: str | None = None,
     back: str | None = None,
-    deck: str | None = None,
 ) -> str:
-    """Edit a card's content without disturbing its schedule. Update any of
-    `front`, `back`, `deck` (omit or pass null to leave unchanged); the FSRS
-    review state (difficulty, stability, due date, reps) is preserved. Use
-    this to fix typos or add context instead of creating a duplicate card.
-    Returns JSON {card_id, front, back, deck}."""
+    """Edit a card's content without disturbing its schedule. Update `front`
+    and/or `back` (omit or pass null to leave unchanged); the FSRS review
+    state (difficulty, stability, due date, reps) is preserved. Use this to
+    fix typos, add context, or shorten an over-long answer, instead of
+    creating a duplicate card. Returns JSON {card_id, front, back, deck}."""
     sets: list[str] = []
     args: list = []
     if front is not None:
@@ -247,11 +284,8 @@ def edit_card(
             raise ValueError("back cannot be blank")
         sets.append("back = ?")
         args.append(b)
-    if deck is not None:
-        sets.append("deck = ?")
-        args.append(deck.strip() or "default")
     if not sets:
-        raise ValueError("nothing to update: pass at least one of front, back, deck")
+        raise ValueError("nothing to update: pass at least one of front, back")
     args.append(card_id)
     with _db() as conn:
         cur = conn.execute(
