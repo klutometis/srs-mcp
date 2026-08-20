@@ -105,6 +105,39 @@ Not done: `stats()` still returns the fragmented `decks` list. It's the only
 way to discover legacy labels for the legacy filter, and `add_card` can no
 longer be tempted by it.
 
+## Shipped — 0.3.0, 2026-08-19
+
+Minor-bumped as breaking (the `deck` parameter is gone). No DB migration; the
+Neon `srs` deck all three hosts share was never touched.
+
+Fleet config lives in `~/prg/mcp-gateway-config/deploy/<host>/servers.json`;
+each host mounts srs differently, so "ship" meant three mechanisms:
+
+| target | how it gets srs | action | verified |
+|---|---|---|---|
+| this box (`danenberg2`, uses the **laptop** config) | `uvx srs-mcp` \u2192 PyPI | publish + `systemctl --user restart mcp-gateway` | `add_card(front, back)`, dist-info 0.3.0 |
+| `danenberg-central.c.googlers.com` | `uvx srs-mcp` \u2192 PyPI | same | same, 0.3.0 |
+| `mcp.danenberg.ai` | Railway proj `mcp-gateway`, svc `srs`, at `srs.railway.internal:8000` | `railway up` from the main checkout | signatures read back over `railway ssh` |
+
+- PyPI 0.3.0 published (token: `pass pypi.org/api-token`); `main` and tag
+  `v0.3.0` pushed to GitHub.
+- Railway has **no** GitHub connection (`source.repo = None`) \u2014 it deploys by
+  CLI upload from `~/prg/srs-mcp`, which is the linked directory. Don't expect
+  a push to deploy it.
+- `uvx` picked up 0.3.0 without a cache clean; each host built a fresh
+  environment on gateway restart.
+- End-to-end through the local gateway: `due_cards(q="horace")` returns real
+  Horace cards, and the served schema is `add_card[front, back]` /
+  `due_cards[q, limit, deck]`.
+
+Still on 0.2.1: `deploy/vm/servers.json` (vm.danenberg.ai) \u2014 not requested;
+it will pick 0.3.0 up whenever its gateway restarts, and nothing there passes
+`deck`, so the upgrade is a no-op for it. srs is deliberately disabled on
+`mcp-demo.danenberg.ai`. Mneme is untouched, by request.
+
+The gateway exposes only 6 of the 9 srs tools (`list_cards` and `stats` are
+suppressed), so `q` is reachable in practice via `due_cards`.
+
 ## What this gives up, honestly
 
 Groupings the text does not state — "cards for Thursday's talk." Real, ~7%
